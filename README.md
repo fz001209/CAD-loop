@@ -109,7 +109,7 @@ requirements.txt:列出了项目依赖的 Python 库（如 openai, langchain, py
 
 README.md:说明文档，介绍如何安装和使用。
 
-Zusammenfassung：数据流向示例在这个结构下，当你运行程序时，流程通常是这样的：
+## Zusammenfassung：数据流向示例在这个结构下，当你运行程序时，流程通常是这样的：
 启动: main.py 读取 config/ 中的配置。
 初始化: create_agents.py 根据配置创建 Agent 实例。
 运行: workspace/runs/<new_id> 文件夹被创建。
