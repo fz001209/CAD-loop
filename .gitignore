@@ -1,1 +1,79 @@
+#######################################
+# Python / Runtime
+#######################################
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+#######################################
+# IDE / OS
+#######################################
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+#######################################
+# Workspace (runtime data, NOT versioned)
+#######################################
 workspace/
+workspace/**
+runs/
+runs/**
+
+#######################################
+# Temporary / Cache
+#######################################
+tmp/
+tmp/**
+.cache/
+.cache/**
+pip-wheel-metadata/
+
+#######################################
+# Logs / Events / Metrics (auto-generated)
+#######################################
+*.log
+event*.json
+events*.json
+metrics*.json
+verify_report*.json
+exec_log*.txt
+
+#######################################
+# CAD / Geometry Outputs (generated)
+#######################################
+*.stl
+*.step
+*.stp
+*.brep
+*.scad
+*.iges
+*.igs
+*.obj
+*.glb
+
+#######################################
+# Test outputs
+#######################################
+tests/results/
+tests/results/**
+
+#######################################
+# Large generated CAD collections
+#######################################
+NewCADs/
+NewCADs/**
+GeneratedCADs/
+GeneratedCADs/**
+
+#######################################
+# Safety: keep docs & examples tracked
+#######################################
+!docs/**
+!README.md
