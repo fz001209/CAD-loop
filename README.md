@@ -3,6 +3,8 @@
 **1 Planner → 2 CADWriter → 3 Executor → 4A Verifer → 5 Optimizer → 6 Memory**
 
 ## 1. 功能概览
+## 流程图
+[Flussdiagramm](docs/Flussdiagramm.png)
 
 ### 主通路 Agent（本仓库已实现）
 - **Agent 1（Planner）**  
