@@ -4,7 +4,7 @@
 
 ## 1. 功能概览
 ## 流程图
-[Flussdiagramm](docs/Flussdiagramm.png)
+[Flussdiagramm](docs/Flussdiagramm.drawio.png)
 
 ### 主通路 Agent（本仓库已实现）
 - **Agent 1（Planner）**  
