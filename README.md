@@ -62,8 +62,8 @@ MAAS/
         artifacts/
         memory/
 
-###注释
--##1.核心代码层 (src/)##
+### 注释
+-**1.核心代码层 (src/)**
 
 main.py:
 作用: 程序的入口点（Entry Point）。
@@ -83,7 +83,7 @@ utils/ (工具库):
   schemas.py: 数据结构定义。通常使用Pydantic定义输入输出的格式（JSON Schema），确保 Agent之间传递的数据格式正确。
   render_stub.py: 模板渲染。可能用于将动态变量填入提示词（Prompt）模板中，或者格式化输出结果。
 
--##2.配置层 (config/)将配置与代码分离，方便调整AI的行为而无需修改代码。##
+-**2.配置层 (config/)将配置与代码分离，方便调整AI的行为而无需修改代码。**
 
 system_message.yaml:
 作用: 提示词工程（Prompt Engineering）的核心。
@@ -93,7 +93,7 @@ models_config.yaml:
 作用: 模型配置。
 内容: 存放 API Key（通常引用环境变量）、模型名称（GPT-4, Claude-3 等）、温度（Temperature）等参数。
 
--##3.工作目录，空间 (workspace/)这是项目运行时的“工作台”。添加到.gitignore 中，因为它包含的是动态生成的数据，避免无意义保存。##
+-**3.工作目录，空间 (workspace/)这是项目运行时的“工作台”。添加到.gitignore 中，因为它包含的是动态生成的数据，避免无意义保存。**
 
 runs/:
 作用: 历史记录容器。
@@ -104,7 +104,7 @@ runs/:
   artifacts/: (产物) Agent 生成的最终结果。比如生成的代码文件、Markdown 报告、图表等。
   memory/: (记忆) 存放对话历史或向量数据库索引。如果 Agent 需要“记住”之前的几轮对话，数据会存在这里。
 
--##4.项目根目录文件##
+-**4.项目根目录文件**
 requirements.txt:列出了项目依赖的 Python 库（如 openai, langchain, pydantic, pyyaml 等）。
 
 README.md:说明文档，介绍如何安装和使用。
