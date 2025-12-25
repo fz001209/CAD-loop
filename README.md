@@ -17,12 +17,12 @@
 
 - **Agent 3（Executor）**  
   Imput：'cad_script.py'  
-  Output：'output_manifest.json'+'exec.log.txt'+'event3.json'
+  Output：'output_manifest.json'+'event3.json'
 
 - **Agent 4A（Verifier）**  
-  Imput：'plan.json'+'output_manifest.json'+（可选）渲染图  
+  Imput：'plan.json'+'output_manifest.json'
   Output：'verify_report.json'+'event4A.json'  
-  说明：若存在'artifacts/render/*.png'，优先用 MLLM 评审；否则降级为静态检查（manifest/约束一致性）。
+  说明：“若 png_paths[] 非空且文件可读，则进行 MLLM 评审；若渲染失败导致无可用图片，则仅执行输出一致性与约束字段完整性检查，并在 issues[] 中标记                           missing_render_evidence。”
 
 - **Agent 5（Optimizer）**  
   Imput：'verify_report.json'+'plan.json'+（可选）'cad_script.py'  
@@ -34,15 +34,13 @@
   Output：  
   - 'events_merged.json'（合并所有 event*.json）  
   - 'final_model.zip'（包含最终模型文件与证据图）  
-  - 'event6.json'  
   同时把**所有实体文件**归档到 'memory'（含用户输入、每个 agent 输出、每个事件文件）。
 
----
 
 ## 2. 仓库目录结构
 
-```text
-your_project/
+README.md
+CAD-loop/
   src/
     main.py
     agents/
@@ -63,4 +61,3 @@ your_project/
         artifacts/
         memory/
   requirements.txt
-  README.md
