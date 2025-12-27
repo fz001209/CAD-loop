@@ -35,8 +35,8 @@ def main():
     user_input_dst = paths["input"] / user_input_src.name
     copy_file(user_input_src, user_input_dst)
 
-    # --------- LLM CONFIG（后续可接入 MEDA 的 ConfigManager；这里先给最小可改版）---------
-    # 需要在环境变量里设置 OPENAI_API_KEY 或改成实际的 provider。
+    # --------- LLM CONFIG（这里先给最小可改版）---------
+    # 在环境变量里设置 OPENAI_API_KEY 。
     llm_config = {
         "temperature": 0.2,
         "config_list": [
