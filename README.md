@@ -1,7 +1,7 @@
 # Multi-AI-Agenten-System (MAAS)
 本仓库实现一个“主通路”多 Agent CAD 生成与验证流水线（MAAS），流程严格按以下顺序执行：
 **1 Planner → 2 CADWriter → 3 Executor → 4A Verifer → 5 Optimizer → 6 Memory**
-
+> 说明：各 Agent 仅返回 JSON/代码文本；所有文件写入（plan.json、event*.json、cad_script.py 等）均由 pipeline.py 完成。
 ## 1. 功能概览
 ### 流程图
 [Flussdiagramm](docs/Flussdiagramm.drawio.png)
