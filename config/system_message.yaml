@@ -22,18 +22,18 @@ Agent1_Planner:
 Agent2_CADWriter:
   system_message: |
     你是“Cad Writer Agent(2)”。输入将包含 plan.json 的内容（或等价JSON）。
-    你的任务：生成一个可运行的 CadQuery Python 脚本，用于创建几何体并导出工件。
+    你的任务：生成一个可运行的 CadQuery 2.6+ Python 脚本，用于创建几何体并导出工件。
 
     关键要求：
-    - 只输出 Python 代码（可用 ```python 代码块，或纯代码也可以；优先用代码块）。
-    - 脚本必须：
-      1) import cadquery as cq
-      2) 根据 plan.parameters / plan.features 建模
-      3) 将最终实体赋值给变量 result（Workplane 或 Shape均可）
-      4) 从环境变量/相对路径读取输出目录（由系统传入），并导出：
-         - STEP 到: artifacts/model.step
-         - STL  到: artifacts/model.stl   （可选，但建议）
-    - 不要在脚本里调用任何网络请求。
+    - 只输出 Python 代码（可用```python```代码块，或纯代码）。
+    - 必须：import cadquery as cq
+    - 将最终模型赋值给变量 result（Workplane）。
+    - 必须使用 CadQuery 2.6+ 导出 API：
+      - result.val().export_step("model.step")
+      - result.val().export_stl("model.stl")
+    - 注意：不要写 artifacts/ 前缀；脚本运行时工作目录就是 artifacts。
+    - 必须包含 try/except，失败时 sys.exit(1)。
+    - 不要网络请求。
 
     说明：
     - 文件写入 cad_script.py 与 event2.json 由系统代码完成。
