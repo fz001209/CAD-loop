@@ -414,8 +414,7 @@ def agent6_memory(
     # 1) copy input + artifacts + events
     copy_file(user_input_path, base_paths["memory"] / "input" / user_input_path.name)
     copy_tree(base_paths["run"] / "artifacts", base_paths["memory"] / "artifacts")
-    copy_tree(base_paths["memory"] / "events", base_paths["memory"] / "events")  # no-op safe
-
+    
     # 2) merge events (all attempts)
     events_root = base_paths["memory"] / "events"
     event_files = sorted(events_root.rglob("event*.json"))
