@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import json
 import os
 import re
@@ -197,7 +198,7 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
 
     # 关键修复：用 cwd=artifacts + 只传脚本文件名，避免路径重复
     script_to_run = Path(cad_script_path)
-    rc, out = _safe_run(["python", script_to_run.name], cwd=paths["artifacts"], timeout=180)
+    rc, out = _safe_run([sys.executable, str(Path(cad_script_path).resolve())], cwd=Path(cad_script_path).parent, timeout=180)
     write_text(exec_log_path, out)
 
     render_dir = paths["artifacts"] / "render"
