@@ -441,9 +441,9 @@ def agent6_memory(
     write_json(merged_events_path, merged)
     copy_file(merged_events_path, base_paths["memory"] / "events_merged.json")
 
-    # 3) zip package
+        # 3) zip package
     import zipfile
-
+    
     def _safe_arcname(p: Path, base_dir: Path) -> str:
         """把真实路径映射为 zip 内部路径，统一用相对路径，避免重复/混乱。"""
         p = p.resolve()
@@ -467,7 +467,7 @@ def agent6_memory(
             seen.add(arcname)
 
         # 1) 打包“memory/artifacts”整棵树（这里最完整，包含 attempt_01/02/03）
-        mem_artifacts_dir = (paths["memory"] / "artifacts").resolve()
+        mem_artifacts_dir = (base_paths["memory"] / "artifacts").resolve()  # 注意：应该是base_paths不是paths
         if mem_artifacts_dir.exists():
             for p in mem_artifacts_dir.rglob("*"):
                 if p.is_file():
@@ -475,7 +475,7 @@ def agent6_memory(
                     add_file(p, arc)
 
         # 2) 打包渲染图（如果你渲染图不在 memory/artifacts 里，也可以保留）
-        render_dir = paths["artifacts"] / "render"
+        render_dir = base_paths["artifacts"] / "render"  # 注意：应该是base_paths不是paths
         if render_dir.exists():
             for p in sorted(render_dir.glob("*.png")):
                 add_file(p, f"artifacts/render/{p.name}")
@@ -492,7 +492,6 @@ def agent6_memory(
                 add_file(f, f"artifacts/{f.name}")
 
     copy_file(final_zip_path, base_paths["memory"] / "final_model.zip")
-
     return final_zip_path, merged_events_path
 
 
