@@ -442,7 +442,7 @@ def agent6_memory(
     copy_file(merged_events_path, base_paths["memory"] / "events_merged.json")
 
     # 3) zip package
-        import zipfile
+    import zipfile
 
     def _safe_arcname(p: Path, base_dir: Path) -> str:
         """把真实路径映射为 zip 内部路径，统一用相对路径，避免重复/混乱。"""
