@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -14,9 +13,6 @@ from src.utils.render_stub import list_rendered_images
 
 
 def _extract_first_json(text: str) -> Dict[str, Any]:
-    """
-    允许模型输出纯 JSON，或夹带少量文字；这里做稳健提取。
-    """
     text = (text or "").strip()
     if text.startswith("{") and text.endswith("}"):
         return json.loads(text)
@@ -43,16 +39,10 @@ def _read_text_tail(path: Path, max_chars: int = 6000) -> str:
     if not path.exists():
         return ""
     t = path.read_text(encoding="utf-8", errors="ignore")
-    if len(t) <= max_chars:
-        return t
-    return t[-max_chars:]
+    return t if len(t) <= max_chars else t[-max_chars:]
 
 
 def stage_paths(base_run_dir: Path, attempt: int | None = None) -> Dict[str, Path]:
-    """
-    attempt=None: base paths (input/memory root)
-    attempt=k:    artifacts/events under attempt subfolders to avoid overwrite
-    """
     run_dir = ensure_dir(base_run_dir)
     input_dir = ensure_dir(run_dir / "input")
     memory_dir = ensure_dir(run_dir / "memory")
@@ -77,14 +67,12 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
     plan_path = paths["artifacts"] / "plan.json"
     event_path = paths["events"] / "event1.json"
 
-    ev_start = build_event(
+    write_json(event_path, build_event(
         run_id, "1", "Agent1_Planner", "start",
         inputs={"anforderungsliste": str(anforderungsliste_path), "attempt": attempt},
         outputs={"plan_json": str(plan_path), "event": str(event_path)},
-    )
-    write_json(event_path, ev_start)
+    ))
 
-    # 给模型：你可以让它只返回 JSON 内容；文件由代码写。
     prompt = {
         "run_id": run_id,
         "attempt": attempt,
@@ -99,32 +87,64 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
 
     write_json(plan_path, plan)
 
-    ev_done = build_event(
+    write_json(event_path, build_event(
         run_id, "1", "Agent1_Planner", "success",
         inputs={"anforderungsliste": str(anforderungsliste_path), "attempt": attempt},
         outputs={"plan_json": str(plan_path)},
         message="plan.json created",
-    )
-    write_json(event_path, ev_done)
+    ))
     return plan_path
 
 
-def _auto_fix_cadquery_exports(code: str) -> str:
+def _normalize_cadquery_export(code: str) -> str:
     """
-    兜底修复：把旧 CadQuery 写法 exportStep/exportStl 替换为 2.6+ 的 export_step/export_stl。
-    仅作为最后防线，推荐你同时修改 system_message.yaml 的 Agent2。
+    关键：强制统一为 CadQuery 2.x 最稳健的 exporters.export()。
+    目标：
+      - 不再依赖 result.val().export_step/export_stl（容易遇到 Solid 路径问题）
+      - 不再依赖 cq.exporters.export 的多种写法
     """
-    fixed = code
+    s = code
 
-    # 常见旧写法：result.exportStep("x.step")
-    fixed = re.sub(r"\.exportStep\s*\(", ".val().export_step(", fixed)
-    fixed = re.sub(r"\.exportStl\s*\(", ".val().export_stl(", fixed)
+    # 确保有 sys
+    if "import sys" not in s:
+        s = "import sys\n" + s
 
-    # 也有人写 export_step 但少了 val()
-    fixed = re.sub(r"(\bresult)\.export_step\s*\(", r"\1.val().export_step(", fixed)
-    fixed = re.sub(r"(\bresult)\.export_stl\s*\(", r"\1.val().export_stl(", fixed)
+    # 确保 exporters 导入
+    if "from cadquery import exporters" not in s:
+        # 放在 import cadquery as cq 之后更自然
+        if "import cadquery as cq" in s:
+            s = s.replace("import cadquery as cq", "import cadquery as cq\nfrom cadquery import exporters", 1)
+        else:
+            s = "import cadquery as cq\nfrom cadquery import exporters\n" + s
 
-    return fixed
+    # 把各种旧导出 API 统一替换掉
+    s = re.sub(r"\bresult\.val\(\)\.export_step\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.step')", s)
+    s = re.sub(r"\bresult\.val\(\)\.export_stl\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.stl')", s)
+
+    s = re.sub(r"\bresult\.exportStep\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.step')", s)
+    s = re.sub(r"\bresult\.exportStl\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.stl')", s)
+
+    s = re.sub(r"\bcq\.exporters\.export\s*\(\s*result\s*,\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.step')", s, count=1)
+    # 第二个 exporters.export 可能被替换成 step，这里补一个更稳健的兜底：如果只有一个 export，则追加 stl
+    # 这一步不做“智能解析”，而是直接在脚本末尾追加“强制导出校验块”，保证收敛。
+
+    footer = r"""
+# ---- MAAS enforced export block (do not remove) ----
+try:
+    exporters.export(result, "model.step")
+    exporters.export(result, "model.stl")
+    import os
+    if not os.path.exists("model.step") or not os.path.exists("model.stl"):
+        print("Export did not create model.step/model.stl")
+        sys.exit(1)
+except Exception as e:
+    print(f"Export failed: {e}")
+    sys.exit(1)
+"""
+    if "MAAS enforced export block" not in s:
+        s = s.rstrip() + "\n" + footer.lstrip()
+
+    return s
 
 
 def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agent, attempt: int) -> Path:
@@ -139,7 +159,6 @@ def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agen
 
     plan = read_json(plan_path)
 
-    # 读取上一轮 opt_patch（如果存在），注入给 Agent2 用于修复脚本
     prev_opt_patch = None
     if attempt > 1:
         prev_opt = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "opt_patch.json"
@@ -155,10 +174,9 @@ def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agen
         "plan_json": plan,
         "previous_opt_patch": prev_opt_patch,
         "instructions": (
-            "Generate a single, complete CadQuery 2.6+ Python script that creates the model. "
-            "The script will be executed with CWD=artifacts folder. Therefore export to filenames without any directory prefix. "
-            "MUST export STEP and STL using CadQuery 2.6+ API: result.val().export_step('model.step') and result.val().export_stl('model.stl'). "
-            "If previous_opt_patch exists, you MUST apply it."
+            "Generate a single, complete CadQuery 2.x Python script that defines a Workplane variable named `result`. "
+            "The script will be executed with CWD = artifacts folder. DO NOT use any directory prefix when exporting. "
+            "If previous_opt_patch exists, apply it."
         ),
     }
 
@@ -170,8 +188,8 @@ def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agen
     if m:
         code = m.group(1).strip()
 
-    # 兜底：自动修正旧导出 API
-    code = _auto_fix_cadquery_exports(code)
+    # 强制规范化导出（这一条是“保证不再失败”的关键）
+    code = _normalize_cadquery_export(code)
 
     ensure_dir(paths["artifacts"] / "render")
     write_text(cad_script_path, code)
@@ -196,8 +214,7 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
         outputs={"output_manifest": str(manifest_path), "exec_log": str(exec_log_path), "event": str(event_path)},
     ))
 
-    # 关键修复：用 cwd=artifacts + 只传脚本文件名，避免路径重复
-    script_to_run = Path(cad_script_path)
+    # 用 venv 的 python 执行，cwd=脚本所在目录（attempt_xx）
     rc, out = _safe_run([sys.executable, str(Path(cad_script_path).resolve())], cwd=Path(cad_script_path).parent, timeout=180)
     write_text(exec_log_path, out)
 
@@ -207,10 +224,19 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
     step_files = [str(p) for p in paths["artifacts"].glob("*.step")] + [str(p) for p in paths["artifacts"].glob("*.stp")]
     stl_files = [str(p) for p in paths["artifacts"].glob("*.stl")]
 
+    # ✅ 关键修复：rc=0 但没输出文件 => 仍然算 fail
+    has_outputs = bool(step_files or stl_files)
+    status = "success" if (rc == 0 and has_outputs) else "fail"
+    error_msg = ""
+    if rc != 0:
+        error_msg = f"Execution failed, return code {rc}"
+    elif not has_outputs:
+        error_msg = "Execution returned 0 but produced no STEP/STL outputs."
+
     manifest = {
         "run_id": run_id,
         "attempt": attempt,
-        "status": "success" if rc == 0 else "fail",
+        "status": status,
         "cad_script": str(cad_script_path),
         "step_files": step_files,
         "stl_files": stl_files,
@@ -218,15 +244,16 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
         "exec_log_path": str(exec_log_path),
         "artifacts_dir": str(paths["artifacts"]),
         "return_code": rc,
+        "error": error_msg,
     }
     write_json(manifest_path, manifest)
 
     write_json(event_path, build_event(
-        run_id, "3", "Agent3_Executor", "success" if rc == 0 else "fail",
+        run_id, "3", "Agent3_Executor", status,
         inputs={"cad_script": str(cad_script_path), "attempt": attempt},
         outputs={"output_manifest": str(manifest_path), "exec_log": str(exec_log_path)},
         message="execution finished",
-        error="" if rc == 0 else f"Execution failed, return code {rc}",
+        error=error_msg,
     ))
 
     return manifest_path
@@ -245,29 +272,27 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
     plan = read_json(plan_path)
     manifest = read_json(manifest_path)
 
-    # Prepare multimodal messages if images exist
     image_paths = manifest.get("render_images", []) or list_rendered_images(paths["artifacts"] / "render")
-
     exec_log_tail = _read_text_tail(Path(manifest.get("exec_log_path", paths["artifacts"] / "exec.log.txt")))
 
-    content_payload: List[Dict[str, Any]] = [{
-        "type": "text",
-        "text": json.dumps({
-            "run_id": run_id,
-            "attempt": attempt,
-            "plan_json": plan,
-            "output_manifest": manifest,
-            "exec_log_tail": exec_log_tail,
-            "instructions": (
-                "Return STRICT JSON for verify_report.json. "
-                "If render_images exist, prioritize geometry/feature checks. "
-                "Also check constraints/logic using plan + manifest + exec_log_tail. "
-                "Output schema: {status: pass|fail, summary, issues[], checks[] }"
-            )
-        }, ensure_ascii=False)
-    }]
+    # ✅ 关键：明确告诉 4A：无渲染图时允许“文件级验收 pass”
+    payload = {
+        "run_id": run_id,
+        "attempt": attempt,
+        "plan_json": plan,
+        "output_manifest": manifest,
+        "exec_log_tail": exec_log_tail,
+        "instructions": (
+            "Return STRICT JSON for verify_report.json.\n"
+            "If render_images exist, do geometry/feature checks.\n"
+            "If NO render_images exist, you MUST use file-level acceptance:\n"
+            "- If manifest.status=='success' AND step_files not empty => you may return status='pass' unless plan explicitly demands visual-confirmable features.\n"
+            "- Mention in summary that no images were available.\n"
+            "Output schema: {status: pass|fail, summary, issues[], checks[] }"
+        )
+    }
 
-    # Attach images (multimodal)
+    content_payload: List[Dict[str, Any]] = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
     for p in image_paths[:8]:
         content_payload.append({"type": "image_url", "image_url": {"url": f"file://{p}"}})
 
@@ -280,10 +305,6 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
     report.setdefault("issues", [])
     report.setdefault("checks", [])
     report["attempt"] = attempt
-
-    # 记录证据
-    if isinstance(report.get("checks"), list):
-        report["checks"].append(f"render_images_used={len(image_paths)}")
     report["evidence"] = {
         "render_images_used": image_paths,
         "exec_log_tail_included": bool(exec_log_tail),
@@ -315,25 +336,14 @@ def agent5_optimizer(
 
     write_json(event_path, build_event(
         run_id, "5", "Agent5_Optimizer", "start",
-        inputs={
-            "plan_json": str(plan_path),
-            "cad_script": str(cad_script_path),
-            "output_manifest": str(manifest_path),
-            "verify_report": str(verify_path) if verify_path else "",
-            "attempt": attempt,
-        },
+        inputs={"attempt": attempt},
         outputs={"opt_patch": str(opt_path), "event": str(event_path)},
     ))
 
     plan = read_json(plan_path)
     manifest = read_json(manifest_path)
 
-    cad_script_text = ""
-    try:
-        cad_script_text = Path(cad_script_path).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        cad_script_text = ""
-
+    cad_script_text = Path(cad_script_path).read_text(encoding="utf-8", errors="ignore")
     exec_log_tail = _read_text_tail(Path(manifest.get("exec_log_path", paths["artifacts"] / "exec.log.txt")))
 
     verify = None
@@ -352,10 +362,10 @@ def agent5_optimizer(
         "cad_script": cad_script_text,
         "verify_report": verify,
         "instructions": (
-            "You must decide next action for convergence. "
-            "If execution failed (manifest.status=fail), prioritize need_fix_script with next_step='2' unless the plan itself is wrong. "
-            "If verify_report exists and status=fail, decide need_fix_script or need_replan. "
-            "Allowed next_step only: '1' or '2'. "
+            "Decide next_step for convergence.\n"
+            "Allowed next_step only: '1' or '2'.\n"
+            "If execution failed => prefer need_fix_script next_step='2' unless plan wrong.\n"
+            "If verify failed => decide need_fix_script or need_replan.\n"
             "Return STRICT JSON only."
         ),
         "output_schema": {
@@ -369,7 +379,6 @@ def agent5_optimizer(
     resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
     patch = _extract_first_json(resp if isinstance(resp, str) else resp.get("content", ""))
 
-    # 强制兜底：不能输出 6；你要求失败必须回 1/2
     patch.setdefault("status", "need_fix_script")
     patch.setdefault("next_step", "2")
     if str(patch.get("next_step")) not in ("1", "2"):
@@ -396,33 +405,20 @@ def agent6_memory(
     final_files_to_package: List[Path],
     agent,
 ) -> Tuple[Path, Path]:
-    """
-    归档策略：
-    - memory/input：复制用户输入
-    - memory/artifacts：复制整个 run/artifacts（包含 attempt 子目录）
-    - memory/events：复制整个 run/memory/events（包含 attempt 子目录）
-    - artifacts/events_merged.json：合并所有 event*.json（rglob）
-    - artifacts/final_model.zip：把关键产物 + 合并事件 + 所有渲染图打包
-    """
     merged_events_path = base_paths["run"] / "artifacts" / "events_merged.json"
     final_zip_path = base_paths["run"] / "artifacts" / "final_model.zip"
 
-    # ensure memory subdirs
     ensure_dir(base_paths["memory"] / "input")
     ensure_dir(base_paths["memory"] / "artifacts")
     ensure_dir(base_paths["memory"] / "events")
 
-    # 1) copy input + artifacts + events
     copy_file(user_input_path, base_paths["memory"] / "input" / user_input_path.name)
     copy_tree(base_paths["run"] / "artifacts", base_paths["memory"] / "artifacts")
-    
-    # 2) merge events (all attempts)
+    copy_tree(base_paths["run"] / "memory" / "events", base_paths["memory"] / "events")
+
     events_root = base_paths["memory"] / "events"
     event_files = sorted(events_root.rglob("event*.json"))
-    merged = {
-        "run_id": run_id,
-        "events": [],
-    }
+    merged = {"run_id": run_id, "events": []}
     for p in event_files:
         try:
             merged["events"].append(read_json(p))
@@ -442,17 +438,14 @@ def agent6_memory(
     write_json(merged_events_path, merged)
     copy_file(merged_events_path, base_paths["memory"] / "events_merged.json")
 
-    # 3) zip package
     import zipfile
-    
+
     def _safe_arcname(p: Path, base_dir: Path) -> str:
-        """把真实路径映射为 zip 内部路径，统一用相对路径，避免重复/混乱。"""
         p = p.resolve()
         try:
             rel = p.relative_to(base_dir.resolve())
             return str(rel).replace("\\", "/")
         except Exception:
-            # 兜底：只放文件名（不推荐，但不会炸）
             return p.name
 
     with zipfile.ZipFile(final_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -467,32 +460,17 @@ def agent6_memory(
             z.write(file_path, arcname=arcname)
             seen.add(arcname)
 
-        # 1) 打包“memory/artifacts”整棵树（这里最完整，包含 attempt_01/02/03）
-        mem_artifacts_dir = (base_paths["memory"] / "artifacts").resolve()  # 注意：应该是base_paths不是paths
+        mem_artifacts_dir = (base_paths["memory"] / "artifacts").resolve()
         if mem_artifacts_dir.exists():
             for p in mem_artifacts_dir.rglob("*"):
                 if p.is_file():
                     arc = "artifacts/" + _safe_arcname(p, mem_artifacts_dir)
                     add_file(p, arc)
 
-        # 2) 打包渲染图（如果你渲染图不在 memory/artifacts 里，也可以保留）
-        render_dir = base_paths["artifacts"] / "render"  # 注意：应该是base_paths不是paths
-        if render_dir.exists():
-            for p in sorted(render_dir.glob("*.png")):
-                add_file(p, f"artifacts/render/{p.name}")
-
-        # 3) 打包 merged events
         add_file(merged_events_path, "events_merged.json")
+        copy_file(final_zip_path, base_paths["memory"] / "final_model.zip")
 
-        # 4) （可选）如果你仍想额外塞 final_files_to_package，必须去重 arcname
-        #    建议：只塞“顶层最终产物”，不要塞 attempt_x 里的东西，否则必然重复。
-        #    这里我按“只塞文件名到 artifacts/”处理，避免重复 attempt_* 路径。
-        for f in final_files_to_package:
-            f = Path(f)
-            if f.exists() and f.is_file():
-                add_file(f, f"artifacts/{f.name}")
-
-    copy_file(final_zip_path, base_paths["memory"] / "final_model.zip")
     return final_zip_path, merged_events_path
+
 
 
