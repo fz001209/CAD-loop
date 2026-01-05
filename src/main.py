@@ -17,12 +17,12 @@ from src.agents.pipeline import (
 from src.utils.events import new_run_id
 from src.utils.fs import ensure_dir, copy_file
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Path to Anforderungsliste.yaml")
     parser.add_argument("--workspace", default="workspace", help="Workspace root")
-    parser.add_argument("--model", default="gpt-4o", help="Model name")
+    parser.add_argument("--model", default="gpt-4o-mini", help="Model name for agents except 4A")
+    parser.add_argument("--model_4a", default="gpt-4o", help="Model name for Agent4A_Verifier")
     args = parser.parse_args()
 
     run_id = new_run_id()
@@ -42,8 +42,12 @@ def main():
         "temperature": 0.2,
         "config_list": [{"model": args.model, "api_type": "openai"}],
     }
+    llm_config_4a = {
+        "temperature": 0.2,
+        "config_list": [{"model": args.model_4a, "api_type": "openai"}],
+    }
 
-    user, a1, a2, a3, a4, a5, a6 = create_mainpath_agents(llm_config)
+    user, a1, a2, a3, a4, a5, a6 = create_mainpath_agents(llm_config, llm_config_4a=llm_config_4a)
 
     MAX_ATTEMPTS = 3
 
@@ -140,7 +144,6 @@ def main():
     print("final_model.zip:", final_zip)
     print("events_merged.json:", merged_events)
     print("memory_dir:", stage_paths(run_dir)["memory"])
-
 
 if __name__ == "__main__":
     main()
