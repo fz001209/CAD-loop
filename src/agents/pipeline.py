@@ -183,6 +183,7 @@ def _render_stl_to_png_multi6(stl_path: Path, render_dir: Path) -> Tuple[bool, s
         ("view_back.png", 0, 180),
         ("view_left.png", 0, 90),
         ("view_top.png", 90, 0),
+        ("view_bottom.png", -90, 0),
     ]
 
     ok_any = False
@@ -207,13 +208,24 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
         inputs={"anforderungsliste": str(anforderungsliste_path), "attempt": attempt},
         outputs={"plan_json": str(plan_path), "event": str(event_path)},
     ))
+    yaml_text = ""
+    try:
+        yaml_text = Path(anforderungsliste_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        yaml_text = ""
 
     prompt = {
         "run_id": run_id,
         "attempt": attempt,
         "input_file": str(anforderungsliste_path),
-        "instructions": "Read the YAML file content and return plan.json as STRICT JSON only.",
+        "anforderungsliste_yaml": yaml_text,  # ✅关键：把原文给模型
+        "instructions": (
+            "Parse the provided YAML TEXT (anforderungsliste_yaml) and return plan.json as STRICT JSON only. "
+            "DO NOT invent requirements not present in the YAML."
+        ),
     }
+
+
     resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
     plan = _extract_first_json(resp if isinstance(resp, str) else resp.get("content", ""))
 
@@ -255,6 +267,36 @@ def _normalize_cadquery_export(code: str) -> str:
     footer = r"""
 # ---- MAAS enforced export block (do not remove) ----
 try:
+    # ---- geometry self-check (fail fast) ----
+    # 1) must have at least 1 solid
+    try:
+        solids = result.val().Solids()
+        if solids is None or len(solids) == 0:
+            print("Self-check failed: result has no solids")
+            sys.exit(1)
+        # too many solids often means floating parts / unmerged pieces
+        if len(solids) > 1:
+            print(f"Self-check failed: result has {len(solids)} solids (possible floating parts)")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Self-check warning: cannot inspect solids: {e}")
+
+    # 2) bounding box sanity check (avoid absurd geometry)
+    try:
+        bb = result.val().BoundingBox()
+        dx = float(bb.xlen); dy = float(bb.ylen); dz = float(bb.zlen)
+        if dx <= 0 or dy <= 0 or dz <= 0:
+            print("Self-check failed: invalid bounding box")
+            sys.exit(1)
+        # prevent extreme aspect artifacts
+        max_dim = max(dx, dy, dz)
+        min_dim = max(1e-6, min(dx, dy, dz))
+        if max_dim / min_dim > 200:
+            print(f"Self-check failed: extreme aspect ratio bbox=({dx},{dy},{dz})")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Self-check warning: cannot inspect bounding box: {e}")
+
     exporters.export(result, "model.step")
     exporters.export(result, "model.stl")
     import os
@@ -444,9 +486,29 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
         "output_manifest": manifest,
         "exec_log_tail": exec_log_tail,
         "instructions": (
-            "You MUST verify geometry based on provided render images. "
-            "Return STRICT JSON only: {status: pass|fail, summary, issues[], checks[]}."
+            "You MUST verify geometry STRICTLY based on the provided render images AND the plan.\n"
+            "HARD RULES:\n"
+            "A) If ANY required feature is missing => status MUST be 'fail'.\n"
+            "B) If you cannot CONFIRM a required feature from the images => status MUST be 'fail'.\n"
+            "C) If there is any unrelated/extra floating geometry/part => status MUST be 'fail'.\n"
+            "\n"
+            "You must produce a field `feature_evidence_map` that maps each required feature to:\n"
+            "{confirmed: true|false, evidence_images: [filenames], note: string}\n"
+            "\n"
+            "Minimum required features for a mug-like object:\n"
+            "- cylindrical body\n"
+            "- hollow opening at top\n"
+            "- handle attached to body (NOT a separate floating piece)\n"
+            "- flat bottom\n"
+            "\n"
+            "PASS condition is very strict:\n"
+            "- issues must be empty AND\n"
+            "- every required feature must have confirmed=true AND evidence_images not empty.\n"
+            "\n"
+            "Return STRICT JSON only with schema:\n"
+            "{status: pass|fail, summary: string, issues: [], checks: [], feature_evidence_map: { ... }}\n"
         )
+
     }, ensure_ascii=False)}]
         
     for p in image_paths[:8]:
@@ -468,6 +530,7 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
     report.setdefault("summary", "")
     report.setdefault("issues", [])
     report.setdefault("checks", [])
+    report.setdefault("feature_evidence_map", {})
     report["attempt"] = attempt
     report["evidence"] = {
         "render_images_used": image_paths,
@@ -632,6 +695,9 @@ def agent6_memory(
 
         add_file(merged_events_path, "events_merged.json")
         copy_file(final_zip_path, base_paths["memory"] / "final_model.zip")
+
+    return final_zip_path, merged_events_path
+
 
     return final_zip_path, merged_events_path
 
