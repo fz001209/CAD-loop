@@ -12,7 +12,7 @@ def get_system_message(agent: str, system_message_path: str = "config/system_mes
 def termination_msg(x):
     return isinstance(x, dict) and str(x.get("content", "")).strip().upper().endswith("TERMINATE")
 
-def create_mainpath_agents(llm_config: dict, system_message_path: str = "config/system_message.yaml"):
+def create_mainpath_agents(llm_config: dict, llm_config_4a: dict | None = None, system_message_path: str = "config/system_message.yaml"):
     user = UserProxyAgent(
         name="User",
         is_termination_msg=termination_msg,
@@ -42,7 +42,7 @@ def create_mainpath_agents(llm_config: dict, system_message_path: str = "config/
     # 4A：用MULTIMODEL（如 gpt-4o / llama-3.2-vision 等）
     a4 = MultimodalConversableAgent(
         name="Agent4A_Verifier",
-        llm_config=llm_config,
+        llm_config=llm_config_4a or llm_config,
         system_message=get_system_message("Agent4A_Verifier", system_message_path),
     )
 
@@ -59,3 +59,4 @@ def create_mainpath_agents(llm_config: dict, system_message_path: str = "config/
     )
 
     return [user, a1, a2, a3, a4, a5, a6]
+
