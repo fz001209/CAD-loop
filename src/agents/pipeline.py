@@ -699,7 +699,4 @@ def agent6_memory(
     return final_zip_path, merged_events_path
 
 
-    return final_zip_path, merged_events_path
-
-
 
