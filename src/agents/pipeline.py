@@ -197,6 +197,87 @@ def _render_stl_to_png_multi6(stl_path: Path, render_dir: Path) -> Tuple[bool, s
 
 
 # ---------------------------
+# unified diff apply (single file, minimal)
+# ---------------------------
+def _apply_unified_diff(original: str, diff_text: str) -> Tuple[bool, str, str]:
+    """
+    Apply a unified diff to a single text blob (one file) with minimal support.
+    Returns (ok, message, patched_text).
+    """
+    if not diff_text or not diff_text.strip():
+        return True, "empty diff (no-op)", original
+
+    src_lines = original.splitlines(keepends=True)
+    diff_lines = diff_text.splitlines(keepends=True)
+
+    # find first hunk
+    j = 0
+    while j < len(diff_lines) and not diff_lines[j].startswith("@@"):
+        j += 1
+    if j >= len(diff_lines):
+        return False, "no hunks found in unified diff", original
+
+    out: List[str] = []
+    i = 0  # cursor in src_lines
+
+    hunk_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+    while j < len(diff_lines):
+        m = hunk_re.match(diff_lines[j])
+        if not m:
+            return False, f"invalid unified diff header at line {j+1}", original
+
+        old_start = int(m.group(1))
+        target = max(0, old_start - 1)
+        if target < i:
+            return False, "overlapping hunks or invalid order", original
+
+        # copy unchanged prefix
+        out.extend(src_lines[i:target])
+        i = target
+
+        j += 1  # hunk body
+        while j < len(diff_lines) and not diff_lines[j].startswith("@@"):
+            dl = diff_lines[j]
+
+            if dl.startswith("\\"):
+                j += 1
+                continue
+
+            if not dl:
+                j += 1
+                continue
+
+            tag = dl[:1]
+            content = dl[1:]
+
+            if tag == " ":
+                if i >= len(src_lines):
+                    return False, "context beyond EOF", original
+                if src_lines[i] != content:
+                    return False, "context mismatch while applying diff", original
+                out.append(src_lines[i])
+                i += 1
+
+            elif tag == "-":
+                if i >= len(src_lines):
+                    return False, "deletion beyond EOF", original
+                if src_lines[i] != content:
+                    return False, "deletion mismatch while applying diff", original
+                i += 1
+
+            elif tag == "+":
+                out.append(content)
+
+            else:
+                return False, f"unknown diff tag '{tag}'", original
+
+            j += 1
+
+    out.extend(src_lines[i:])
+    return True, "applied", "".join(out)
+
+
+# ---------------------------
 # Agents
 # ---------------------------
 def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: Path, agent, attempt: int) -> Path:
@@ -221,16 +302,52 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
         "anforderungsliste_yaml": yaml_text,  # ✅关键：把原文给模型
         "instructions": (
             "Parse the provided YAML TEXT (anforderungsliste_yaml) and return plan.json as STRICT JSON only. "
-            "DO NOT invent requirements not present in the YAML."
+            "DO NOT invent requirements not present in the YAML.\n"
+            "\n"
+            "Your output MUST follow this structure:\n"
+            "{\n"
+            "  \"object\": \"...\",\n"
+            "  \"required_features\": [\n"
+            "    {\"id\":\"...\",\"name\":\"...\",\"must\":true,\"notes\":\"...\"}\n"
+            "  ],\n"
+            "  \"params\": {\n"
+            "    \"height_mm\": number,\n"
+            "    \"outer_diameter_mm\": number,\n"
+            "    \"wall_thickness_mm\": number,\n"
+            "    \"bottom_thickness_mm\": number,\n"
+            "    \"handle\": {\n"
+            "      \"type\": \"arc_or_sweep\",\n"
+            "      \"thickness_mm\": number,\n"
+            "      \"gap_mm\": number,\n"
+            "      \"attach_to_body\": true\n"
+            "    }\n"
+            "  },\n"
+            "  \"operations\": [\n"
+            "    {\"op\":\"...\",\"args\":{}}\n"
+            "  ]\n"
+            "}\n"
+            "\n"
+            "If YAML describes a mug/cup, required_features MUST include at minimum:\n"
+            "- cylindrical_body\n"
+            "- hollow_top_opening\n"
+            "- handle_attached_not_floating\n"
+            "- flat_bottom\n"
         ),
     }
-
 
     resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
     plan = _extract_first_json(resp if isinstance(resp, str) else resp.get("content", ""))
 
     plan["run_id"] = run_id
     plan["attempt"] = attempt
+
+    # ---- enforce minimal plan schema (non-breaking) ----
+    if "required_features" not in plan or not isinstance(plan.get("required_features"), list):
+        plan["required_features"] = []
+    if "params" not in plan or not isinstance(plan.get("params"), dict):
+        plan["params"] = {}
+    if "operations" not in plan or not isinstance(plan.get("operations"), list):
+        plan["operations"] = []
 
     write_json(plan_path, plan)
 
@@ -326,6 +443,7 @@ def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agen
     plan = read_json(plan_path)
 
     prev_opt_patch = None
+    prev_cad_script_text = None
     if attempt > 1:
         prev_opt = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "opt_patch.json"
         if prev_opt.exists():
@@ -334,30 +452,54 @@ def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agen
             except Exception:
                 prev_opt_patch = None
 
-    prompt = {
-        "run_id": run_id,
-        "attempt": attempt,
-        "plan_json": plan,
-        "previous_opt_patch": prev_opt_patch,
-        "instructions": (
-            "Generate a single, complete CadQuery 2.x Python script that defines a Workplane variable named `result`. "
-            "The script will be executed with CWD = artifacts folder. DO NOT use any directory prefix when exporting. "
-            "If previous_opt_patch exists, apply it."
-        ),
-    }
+        prev_cad = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "cad_script.py"
+        if prev_cad.exists():
+            try:
+                prev_cad_script_text = prev_cad.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                prev_cad_script_text = None
 
-    resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
-    text = resp if isinstance(resp, str) else resp.get("content", "")
+    # ---- deterministic patch application (unified_diff) ----
+    applied_by_diff = False
+    if prev_opt_patch and isinstance(prev_opt_patch, dict):
+        p = prev_opt_patch.get("patch") or {}
+        if isinstance(p, dict) and p.get("type") == "unified_diff":
+            diff_text = p.get("content", "") or ""
+            if prev_cad_script_text is not None and diff_text.strip():
+                ok, msg, patched = _apply_unified_diff(prev_cad_script_text, diff_text)
+                if ok:
+                    code = patched
+                    code = _normalize_cadquery_export(code)
+                    ensure_dir(paths["artifacts"] / "render")
+                    write_text(cad_script_path, code)
+                    applied_by_diff = True
 
-    code = text
-    m = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.S)
-    if m:
-        code = m.group(1).strip()
+    if not applied_by_diff:
+        prompt = {
+            "run_id": run_id,
+            "attempt": attempt,
+            "plan_json": plan,
+            "previous_opt_patch": prev_opt_patch,
+            "instructions": (
+                "Generate a single, complete CadQuery 2.x Python script that defines a Workplane variable named `result`. "
+                "The script will be executed with CWD = artifacts folder. DO NOT use any directory prefix when exporting. "
+                "If previous_opt_patch exists, apply it. "
+                "If previous_opt_patch.patch.type is 'unified_diff', you MUST implement exactly those changes."
+            ),
+        }
 
-    code = _normalize_cadquery_export(code)
+        resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
+        text = resp if isinstance(resp, str) else resp.get("content", "")
 
-    ensure_dir(paths["artifacts"] / "render")
-    write_text(cad_script_path, code)
+        code = text
+        m = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.S)
+        if m:
+            code = m.group(1).strip()
+
+        code = _normalize_cadquery_export(code)
+
+        ensure_dir(paths["artifacts"] / "render")
+        write_text(cad_script_path, code)
 
     write_json(event_path, build_event(
         run_id, "2", "Agent2_CADWriter", "success",
@@ -387,16 +529,39 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
     step_files = [str(p) for p in paths["artifacts"].glob("*.step")] + [str(p) for p in paths["artifacts"].glob("*.stp")]
     stl_files = [str(p) for p in paths["artifacts"].glob("*.stl")]
 
-    # ---- NEW: render 6 views if possible ----
+    # ---- render views if STL exists (even if rc != 0, as long as STL is present) ----
     render_msg = ""
-    if rc == 0 and stl_files:
-        # 只要有 STL，就生成/刷新 6 视角图（提升 4A 稳健性）
+    if stl_files:
         ok, msg = _render_stl_to_png_multi6(Path(stl_files[0]), render_dir)
         render_msg = msg if ok else f"render_failed: {msg}"
 
     imgs = list_rendered_images(render_dir)
 
-    # 原逻辑：rc=0 且有 step/stl 才算成功
+    # ---- NEW: geometry metrics (non-image feedback for Agent5) ----
+    geometry_metrics: Dict[str, Any] = {}
+    try:
+        if stl_files:
+            stl_path = Path(stl_files[0])
+            tris = _parse_stl_triangles(stl_path)
+            if tris:
+                xs = [p[0] for tri in tris for p in tri]
+                ys = [p[1] for tri in tris for p in tri]
+                zs = [p[2] for tri in tris for p in tri]
+                geometry_metrics = {
+                    "stl_triangle_count": len(tris),
+                    "bbox": {
+                        "x_min": min(xs), "x_max": max(xs),
+                        "y_min": min(ys), "y_max": max(ys),
+                        "z_min": min(zs), "z_max": max(zs),
+                        "dx": max(xs) - min(xs),
+                        "dy": max(ys) - min(ys),
+                        "dz": max(zs) - min(zs),
+                    },
+                }
+    except Exception as e:
+        geometry_metrics = {"error": f"metrics_failed: {e}"}
+
+    # original success condition
     has_outputs = bool(step_files or stl_files)
     status = "success" if (rc == 0 and has_outputs) else "fail"
     error_msg = ""
@@ -405,7 +570,7 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
     elif not has_outputs:
         error_msg = "Execution returned 0 but produced no STEP/STL outputs."
 
-    # ---- NEW: 你要求 4A 必须基于渲染图，所以这里补一条“无图则 fail” ----
+    # if execution "success" but no render images, fail (4A requires PNGs)
     if status == "success" and not imgs:
         status = "fail"
         error_msg = "Execution ok but produced no render images (PNG required for 4A). " + (render_msg or "")
@@ -418,6 +583,7 @@ def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, 
         "step_files": step_files,
         "stl_files": stl_files,
         "render_images": imgs,
+        "geometry_metrics": geometry_metrics,
         "exec_log_path": str(exec_log_path),
         "artifacts_dir": str(paths["artifacts"]),
         "return_code": rc,
@@ -452,7 +618,7 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
     image_paths = manifest.get("render_images", []) or list_rendered_images(paths["artifacts"] / "render")
     exec_log_tail = _read_text_tail(Path(manifest.get("exec_log_path", paths["artifacts"] / "exec.log.txt")))
 
-    # 你的硬要求：无图则 fail
+    # hard rule: no images => fail
     if not image_paths:
         report = {
             "status": "fail",
@@ -510,13 +676,12 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
         )
 
     }, ensure_ascii=False)}]
-        
+
     for p in image_paths[:8]:
         try:
-            img = Image.open(p)  # p 是普通文件路径字符串/Path 都行
+            img = Image.open(p)
             content_payload.append({"type": "image_url", "image_url": {"url": img}})
         except Exception as e:
-            # 如果某张图损坏/打不开，不要让整个流程崩掉；把原因写进文本证据即可
             content_payload.append({
                 "type": "text",
                 "text": f"[WARN] Failed to open image {p}: {e}"
@@ -593,13 +758,16 @@ def agent5_optimizer(
             "Allowed next_step only: '1' or '2'.\n"
             "If execution failed => prefer need_fix_script next_step='2' unless plan wrong.\n"
             "If verify failed => decide need_fix_script or need_replan.\n"
+            "Also use output_manifest.geometry_metrics (bbox/triangle_count) to diagnose scale/degenerate geometry and guide the patch.\n"
+            "IMPORTANT: patch MUST be a unified diff for the file cad_script.py (single file). "
+            "Set patch.type='unified_diff' and provide patch.content as a valid unified diff with @@ hunks.\n"
             "Return STRICT JSON only."
         ),
         "output_schema": {
             "status": "need_fix_script|need_replan",
             "next_step": "1|2",
             "suggestions": [],
-            "patch": {"type": "instructions|text_diff", "content": "..."}
+            "patch": {"type": "unified_diff", "content": "..."}
         }
     }
 
@@ -612,6 +780,15 @@ def agent5_optimizer(
         patch["next_step"] = "2"
     if patch.get("status") not in ("need_fix_script", "need_replan"):
         patch["status"] = "need_fix_script"
+
+    # ---- enforce unified_diff contract (non-breaking) ----
+    if not isinstance(patch.get("patch"), dict):
+        patch["patch"] = {"type": "unified_diff", "content": ""}
+    else:
+        if patch["patch"].get("type") != "unified_diff":
+            patch["patch"]["type"] = "unified_diff"
+        if patch["patch"].get("content") is None:
+            patch["patch"]["content"] = ""
 
     patch["attempt"] = attempt
     write_json(opt_path, patch)
@@ -697,6 +874,7 @@ def agent6_memory(
         copy_file(final_zip_path, base_paths["memory"] / "final_model.zip")
 
     return final_zip_path, merged_events_path
+
 
 
 
