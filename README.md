@@ -261,7 +261,7 @@ Agent1读取YAML → plan.json
     ↓
 Agent2编译IR → ir.json
     ↓
-Agent3执行IR → CAD模型+渲染图
+Agent3执行IR(Intermediate Representation) → CAD模型+渲染图
     ↓
 Agent4A验证 → pass/fail报告
     ↓
