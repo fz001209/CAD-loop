@@ -17,6 +17,7 @@ from src.agents.pipeline import (
 from src.utils.events import new_run_id
 from src.utils.fs import ensure_dir, copy_file
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Path to Anforderungsliste.yaml")
@@ -29,15 +30,12 @@ def main():
     ws = Path(args.workspace)
     run_dir = ensure_dir(ws / "runs" / run_id)
 
-    # base paths (for input/memory root)
     base_paths = stage_paths(run_dir)
 
-    # copy user input into run/input
     user_input_src = Path(args.input).resolve()
     user_input_dst = base_paths["input"] / user_input_src.name
     copy_file(user_input_src, user_input_dst)
 
-    # LLM config
     llm_config = {
         "temperature": 0.2,
         "config_list": [{"model": args.model, "api_type": "openai"}],
@@ -50,30 +48,31 @@ def main():
     user, a1, a2, a3, a4, a5, a6 = create_mainpath_agents(llm_config, llm_config_4a=llm_config_4a)
 
     MAX_ATTEMPTS = 3
-
     next_step = "1"  # "1" or "2"
+
     plan_path: Path | None = None
+    ir_path: Path | None = None
     success = False
 
     all_final_candidates: list[Path] = []
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         paths = stage_paths(run_dir, attempt=attempt)
+        artifacts = paths["artifacts"]
 
         # 1) Planner
         if next_step == "1" or plan_path is None or not plan_path.exists():
             plan_path = agent1_planner(run_id, paths, user_input_dst, a1, attempt=attempt)
 
-        # 2) CADWriter
-        cad_script_path = agent2_cad_writer(run_id, paths, plan_path, a2, attempt=attempt)
+        # 2) CADWriter (now IR Refiner/Compiler) -> ir.json
+        ir_path = agent2_cad_writer(run_id, paths, plan_path, a2, attempt=attempt)
 
-        # 3) Executor
-        manifest_path = agent3_executor(run_id, paths, cad_script_path, a3, attempt=attempt)
+        # 3) Executor (deterministic IR execution)
+        manifest_path = agent3_executor(run_id, paths, ir_path, a3, attempt=attempt)
 
-        artifacts = paths["artifacts"]
         all_final_candidates += [
             artifacts / "plan.json",
-            artifacts / "cad_script.py",
+            artifacts / "ir.json",
             artifacts / "output_manifest.json",
             artifacts / "exec.log.txt",
         ]
@@ -87,7 +86,7 @@ def main():
                 run_id=run_id,
                 paths=paths,
                 plan_path=plan_path,
-                cad_script_path=cad_script_path,
+                ir_path=ir_path,
                 manifest_path=manifest_path,
                 verify_path=None,
                 agent=a5,
@@ -115,7 +114,7 @@ def main():
             run_id=run_id,
             paths=paths,
             plan_path=plan_path,
-            cad_script_path=cad_script_path,
+            ir_path=ir_path,
             manifest_path=manifest_path,
             verify_path=verify_path,
             agent=a5,
@@ -132,7 +131,7 @@ def main():
     # 6) Memory: always archive
     final_zip, merged_events = agent6_memory(
         run_id=run_id,
-        base_paths=stage_paths(run_dir),  # base paths
+        base_paths=stage_paths(run_dir),
         user_input_path=user_input_dst,
         final_files_to_package=all_final_candidates,
         agent=a6,
@@ -145,6 +144,6 @@ def main():
     print("events_merged.json:", merged_events)
     print("memory_dir:", stage_paths(run_dir)["memory"])
 
+
 if __name__ == "__main__":
     main()
-
