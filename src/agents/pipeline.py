@@ -1,18 +1,25 @@
 from __future__ import annotations
 
-import sys
 import json
 import re
 import struct
-import subprocess
-from PIL import Image
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from PIL import Image
 
 from src.utils.fs import ensure_dir, write_json, write_text, read_json, copy_file, copy_tree
 from src.utils.events import build_event
 from src.utils.render_stub import list_rendered_images
 
+# Route-B deterministic IR executor
+from src.agents.ir_executor import execute_ir, sanitize_ir
+
+
+# ============================================================
+# Common helpers
+# ============================================================
 
 def _extract_first_json(text: str) -> Dict[str, Any]:
     text = (text or "").strip()
@@ -22,19 +29,6 @@ def _extract_first_json(text: str) -> Dict[str, Any]:
     if not m:
         raise ValueError("No JSON object found in model output.")
     return json.loads(m.group(0))
-
-
-def _safe_run(cmd: List[str], cwd: str | Path, timeout: int = 120) -> Tuple[int, str]:
-    p = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        text=True,
-        check=False,
-    )
-    return p.returncode, p.stdout
 
 
 def _read_text_tail(path: Path, max_chars: int = 6000) -> str:
@@ -65,14 +59,11 @@ def stage_paths(base_run_dir: Path, attempt: int | None = None) -> Dict[str, Pat
     }
 
 
-# ---------------------------
-# STL -> PNG rendering (minimal, matplotlib)
-# ---------------------------
+# ============================================================
+# STL -> PNG rendering (matplotlib, minimal)
+# ============================================================
+
 def _parse_stl_triangles(stl_path: Path) -> List[List[List[float]]]:
-    """
-    Return triangles as [[[x,y,z],[x,y,z],[x,y,z]], ...]
-    Supports binary STL and ASCII STL (best-effort).
-    """
     data = stl_path.read_bytes()
     if len(data) < 84:
         return []
@@ -81,19 +72,17 @@ def _parse_stl_triangles(stl_path: Path) -> List[List[List[float]]]:
     expected_len = 84 + tri_count * 50
     triangles: List[List[List[float]]] = []
 
-    # binary STL
     if expected_len == len(data):
         off = 84
         for _ in range(tri_count):
-            off += 12  # normal
+            off += 12
             v1 = struct.unpack("<fff", data[off:off + 12]); off += 12
             v2 = struct.unpack("<fff", data[off:off + 12]); off += 12
             v3 = struct.unpack("<fff", data[off:off + 12]); off += 12
-            off += 2  # attribute
+            off += 2
             triangles.append([[v1[0], v1[1], v1[2]], [v2[0], v2[1], v2[2]], [v3[0], v3[1], v3[2]]])
         return triangles
 
-    # ASCII best-effort
     try:
         text = data.decode("utf-8", errors="ignore")
     except Exception:
@@ -132,22 +121,15 @@ def _render_stl_to_png(stl_path: Path, png_path: Path, elev: float, azim: float)
 
         fig = plt.figure(figsize=(6, 6), dpi=180)
         ax = fig.add_subplot(111, projection="3d")
-
-        poly = Poly3DCollection(
-            tris,
-            linewidths=0.2,
-            edgecolors="black",
-        )
+        poly = Poly3DCollection(tris, linewidths=0.2, edgecolors="black")
         ax.add_collection3d(poly)
 
         xs = [p[0] for tri in tris for p in tri]
         ys = [p[1] for tri in tris for p in tri]
         zs = [p[2] for tri in tris for p in tri]
-
         if not xs or not ys or not zs:
             return False, "empty bounds"
 
-        # equal-ish scale
         dx = max(xs) - min(xs)
         dy = max(ys) - min(ys)
         dz = max(zs) - min(zs)
@@ -171,11 +153,7 @@ def _render_stl_to_png(stl_path: Path, png_path: Path, elev: float, azim: float)
 
 
 def _render_stl_to_png_multi6(stl_path: Path, render_dir: Path) -> Tuple[bool, str]:
-    """
-    Generate 6 standard views to improve 4A robustness.
-    """
     ensure_dir(render_dir)
-
     views = [
         ("view_iso_1.png", 25, 45),
         ("view_iso_2.png", 25, 135),
@@ -192,25 +170,42 @@ def _render_stl_to_png_multi6(stl_path: Path, render_dir: Path) -> Tuple[bool, s
         ok, msg = _render_stl_to_png(stl_path, render_dir / name, elev=elev, azim=azim)
         ok_any = ok_any or ok
         msgs.append(f"{name}:{'ok' if ok else 'fail'}({msg})")
-
     return ok_any, "; ".join(msgs)
 
 
-# ---------------------------
+def _compute_geometry_metrics_from_stl(stl_path: Path) -> Dict[str, Any]:
+    tris = _parse_stl_triangles(stl_path)
+    if not tris:
+        return {"stl_triangle_count": 0, "error": "no triangles"}
+
+    xs = [p[0] for tri in tris for p in tri]
+    ys = [p[1] for tri in tris for p in tri]
+    zs = [p[2] for tri in tris for p in tri]
+
+    return {
+        "stl_triangle_count": len(tris),
+        "bbox": {
+            "x_min": min(xs), "x_max": max(xs),
+            "y_min": min(ys), "y_max": max(ys),
+            "z_min": min(zs), "z_max": max(zs),
+            "dx": max(xs) - min(xs),
+            "dy": max(ys) - min(ys),
+            "dz": max(zs) - min(zs),
+        }
+    }
+
+
+# ============================================================
 # unified diff apply (single file, minimal)
-# ---------------------------
+# ============================================================
+
 def _apply_unified_diff(original: str, diff_text: str) -> Tuple[bool, str, str]:
-    """
-    Apply a unified diff to a single text blob (one file) with minimal support.
-    Returns (ok, message, patched_text).
-    """
     if not diff_text or not diff_text.strip():
         return True, "empty diff (no-op)", original
 
     src_lines = original.splitlines(keepends=True)
     diff_lines = diff_text.splitlines(keepends=True)
 
-    # find first hunk
     j = 0
     while j < len(diff_lines) and not diff_lines[j].startswith("@@"):
         j += 1
@@ -218,7 +213,7 @@ def _apply_unified_diff(original: str, diff_text: str) -> Tuple[bool, str, str]:
         return False, "no hunks found in unified diff", original
 
     out: List[str] = []
-    i = 0  # cursor in src_lines
+    i = 0
 
     hunk_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
     while j < len(diff_lines):
@@ -231,11 +226,10 @@ def _apply_unified_diff(original: str, diff_text: str) -> Tuple[bool, str, str]:
         if target < i:
             return False, "overlapping hunks or invalid order", original
 
-        # copy unchanged prefix
         out.extend(src_lines[i:target])
         i = target
 
-        j += 1  # hunk body
+        j += 1
         while j < len(diff_lines) and not diff_lines[j].startswith("@@"):
             dl = diff_lines[j]
 
@@ -277,9 +271,10 @@ def _apply_unified_diff(original: str, diff_text: str) -> Tuple[bool, str, str]:
     return True, "applied", "".join(out)
 
 
-# ---------------------------
+# ============================================================
 # Agents
-# ---------------------------
+# ============================================================
+
 def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: Path, agent, attempt: int) -> Path:
     plan_path = paths["artifacts"] / "plan.json"
     event_path = paths["events"] / "event1.json"
@@ -289,7 +284,7 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
         inputs={"anforderungsliste": str(anforderungsliste_path), "attempt": attempt},
         outputs={"plan_json": str(plan_path), "event": str(event_path)},
     ))
-    yaml_text = ""
+
     try:
         yaml_text = Path(anforderungsliste_path).read_text(encoding="utf-8", errors="ignore")
     except Exception:
@@ -299,39 +294,21 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
         "run_id": run_id,
         "attempt": attempt,
         "input_file": str(anforderungsliste_path),
-        "anforderungsliste_yaml": yaml_text,  # ✅关键：把原文给模型
+        "anforderungsliste_yaml": yaml_text,
         "instructions": (
-            "Parse the provided YAML TEXT (anforderungsliste_yaml) and return plan.json as STRICT JSON only. "
-            "DO NOT invent requirements not present in the YAML.\n"
+            "Parse the YAML TEXT and output STRICT JSON only.\n"
+            "Do not invent requirements not present in the YAML.\n"
             "\n"
-            "Your output MUST follow this structure:\n"
-            "{\n"
-            "  \"object\": \"...\",\n"
-            "  \"required_features\": [\n"
-            "    {\"id\":\"...\",\"name\":\"...\",\"must\":true,\"notes\":\"...\"}\n"
-            "  ],\n"
-            "  \"params\": {\n"
-            "    \"height_mm\": number,\n"
-            "    \"outer_diameter_mm\": number,\n"
-            "    \"wall_thickness_mm\": number,\n"
-            "    \"bottom_thickness_mm\": number,\n"
-            "    \"handle\": {\n"
-            "      \"type\": \"arc_or_sweep\",\n"
-            "      \"thickness_mm\": number,\n"
-            "      \"gap_mm\": number,\n"
-            "      \"attach_to_body\": true\n"
-            "    }\n"
-            "  },\n"
-            "  \"operations\": [\n"
-            "    {\"op\":\"...\",\"args\":{}}\n"
-            "  ]\n"
-            "}\n"
+            "You MUST output an IR-like plan with these top-level keys:\n"
+            "- object: string\n"
+            "- required_features: list of {id,name,must,notes}\n"
+            "- params: dict (numeric params in mm where applicable)\n"
+            "- operations: list of {id,op,args}\n"
             "\n"
-            "If YAML describes a mug/cup, required_features MUST include at minimum:\n"
-            "- cylindrical_body\n"
-            "- hollow_top_opening\n"
-            "- handle_attached_not_floating\n"
-            "- flat_bottom\n"
+            "IMPORTANT:\n"
+            "- operations are conceptual IR (not CadQuery code).\n"
+            "- Every operation MUST have a stable unique 'id' (string).\n"
+            "- If you cannot confidently map a requirement to operations, list it under required_features with must=true.\n"
         ),
     }
 
@@ -341,13 +318,13 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
     plan["run_id"] = run_id
     plan["attempt"] = attempt
 
-    # ---- enforce minimal plan schema (non-breaking) ----
-    if "required_features" not in plan or not isinstance(plan.get("required_features"), list):
-        plan["required_features"] = []
-    if "params" not in plan or not isinstance(plan.get("params"), dict):
-        plan["params"] = {}
-    if "operations" not in plan or not isinstance(plan.get("operations"), list):
-        plan["operations"] = []
+    plan = sanitize_ir(plan)
+
+    ops = plan.get("operations", []) or []
+    for i, op in enumerate(ops, start=1):
+        if not op.get("id"):
+            op["id"] = f"OP{i:02d}"
+    plan["operations"] = ops
 
     write_json(plan_path, plan)
 
@@ -360,240 +337,243 @@ def agent1_planner(run_id: str, paths: Dict[str, Path], anforderungsliste_path: 
     return plan_path
 
 
-def _normalize_cadquery_export(code: str) -> str:
-    """
-    强制统一为 CadQuery 2.x 最稳健的 exporters.export() 并追加强制导出块。
-    """
-    s = code
-
-    if "import sys" not in s:
-        s = "import sys\n" + s
-
-    if "from cadquery import exporters" not in s:
-        if "import cadquery as cq" in s:
-            s = s.replace("import cadquery as cq", "import cadquery as cq\nfrom cadquery import exporters", 1)
-        else:
-            s = "import cadquery as cq\nfrom cadquery import exporters\n" + s
-
-    s = re.sub(r"\bresult\.val\(\)\.export_step\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.step')", s)
-    s = re.sub(r"\bresult\.val\(\)\.export_stl\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.stl')", s)
-
-    s = re.sub(r"\bresult\.exportStep\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.step')", s)
-    s = re.sub(r"\bresult\.exportStl\s*\(\s*['\"].*?['\"]\s*\)", "exporters.export(result, 'model.stl')", s)
-
-    footer = r"""
-# ---- MAAS enforced export block (do not remove) ----
-try:
-    # ---- geometry self-check (fail fast) ----
-    # 1) must have at least 1 solid
-    try:
-        solids = result.val().Solids()
-        if solids is None or len(solids) == 0:
-            print("Self-check failed: result has no solids")
-            sys.exit(1)
-        # too many solids often means floating parts / unmerged pieces
-        if len(solids) > 1:
-            print(f"Self-check failed: result has {len(solids)} solids (possible floating parts)")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Self-check warning: cannot inspect solids: {e}")
-
-    # 2) bounding box sanity check (avoid absurd geometry)
-    try:
-        bb = result.val().BoundingBox()
-        dx = float(bb.xlen); dy = float(bb.ylen); dz = float(bb.zlen)
-        if dx <= 0 or dy <= 0 or dz <= 0:
-            print("Self-check failed: invalid bounding box")
-            sys.exit(1)
-        # prevent extreme aspect artifacts
-        max_dim = max(dx, dy, dz)
-        min_dim = max(1e-6, min(dx, dy, dz))
-        if max_dim / min_dim > 200:
-            print(f"Self-check failed: extreme aspect ratio bbox=({dx},{dy},{dz})")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Self-check warning: cannot inspect bounding box: {e}")
-
-    exporters.export(result, "model.step")
-    exporters.export(result, "model.stl")
-    import os
-    if not os.path.exists("model.step") or not os.path.exists("model.stl"):
-        print("Export did not create model.step/model.stl")
-        sys.exit(1)
-except Exception as e:
-    print(f"Export failed: {e}")
-    sys.exit(1)
-"""
-    if "MAAS enforced export block" not in s:
-        s = s.rstrip() + "\n" + footer.lstrip()
-
-    return s
-
-
 def agent2_cad_writer(run_id: str, paths: Dict[str, Path], plan_path: Path, agent, attempt: int) -> Path:
-    cad_script_path = paths["artifacts"] / "cad_script.py"
+    ir_path = paths["artifacts"] / "ir.json"
     event_path = paths["events"] / "event2.json"
 
     write_json(event_path, build_event(
         run_id, "2", "Agent2_CADWriter", "start",
         inputs={"plan_json": str(plan_path), "attempt": attempt},
-        outputs={"cad_script": str(cad_script_path), "event": str(event_path)},
+        outputs={"ir_json": str(ir_path), "event": str(event_path)},
     ))
 
     plan = read_json(plan_path)
 
-    prev_opt_patch = None
-    prev_cad_script_text = None
+    # -----------------------------
+    # apply unified diff from previous opt_patch to previous ir.json
+    # -----------------------------
     if attempt > 1:
-        prev_opt = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "opt_patch.json"
-        if prev_opt.exists():
+        prev_opt_path = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "opt_patch.json"
+        prev_ir_path = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "ir.json"
+
+        if prev_opt_path.exists() and prev_ir_path.exists():
             try:
-                prev_opt_patch = read_json(prev_opt)
+                prev_opt = read_json(prev_opt_path)
+                patch_obj = prev_opt.get("patch") if isinstance(prev_opt, dict) else None
+                if isinstance(patch_obj, dict) and patch_obj.get("type") == "unified_diff":
+                    diff_text = patch_obj.get("content") or ""
+                    if diff_text.strip():
+                        base_text = prev_ir_path.read_text(encoding="utf-8", errors="ignore")
+                        ok, msg, patched_text = _apply_unified_diff(base_text, diff_text)
+                        if ok:
+                            patched_json_raw = json.loads(patched_text)
+
+                            # hard validate no unknown ops introduced (MUST include primitive_torus)
+                            allowed = set([
+                                "primitive_box", "primitive_cylinder", "primitive_sphere", "primitive_torus",
+                                "sketch_rect", "sketch_circle", "sketch_polygon",
+                                "extrude", "cut_extrude",
+                                "translate", "rotate",
+                                "union", "cut", "intersect",
+                                "hole", "fillet", "chamfer", "shell",
+                            ])
+                            raw_ops = patched_json_raw.get("operations", [])
+                            unknown = []
+                            for op in raw_ops:
+                                if isinstance(op, dict):
+                                    name = str(op.get("op", "")).strip()
+                                    if name and name not in allowed:
+                                        unknown.append(name)
+                            if unknown:
+                                raise ValueError(f"Patch introduced unknown ops: {sorted(set(unknown))}")
+
+                            patched_json_raw["run_id"] = run_id
+                            patched_json_raw["attempt"] = attempt
+                            patched_json = sanitize_ir(patched_json_raw)
+
+                            ops = patched_json.get("operations", []) or []
+                            for i, op in enumerate(ops, start=1):
+                                if not op.get("id"):
+                                    op["id"] = f"OP{i:02d}"
+                            patched_json["operations"] = ops
+
+                            write_json(ir_path, patched_json)
+                            write_json(event_path, build_event(
+                                run_id, "2", "Agent2_CADWriter", "success",
+                                inputs={"plan_json": str(plan_path), "attempt": attempt, "patched_from": str(prev_ir_path)},
+                                outputs={"ir_json": str(ir_path)},
+                                message="ir.json created by applying unified_diff patch",
+                            ))
+                            return ir_path
             except Exception:
-                prev_opt_patch = None
+                pass
 
-        prev_cad = paths["run"] / "artifacts" / f"attempt_{attempt-1:02d}" / "cad_script.py"
-        if prev_cad.exists():
-            try:
-                prev_cad_script_text = prev_cad.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                prev_cad_script_text = None
+    # -----------------------------
+    # LLM generation (fallback)
+    # -----------------------------
+    allowed_ops_list = [
+        "primitive_box","primitive_cylinder","primitive_sphere","primitive_torus",
+        "sketch_rect","sketch_circle","sketch_polygon",
+        "extrude","cut_extrude",
+        "translate","rotate",
+        "union","cut","intersect",
+        "hole","fillet","chamfer","shell"
+    ]
 
-    # ---- deterministic patch application (unified_diff) ----
-    applied_by_diff = False
-    if prev_opt_patch and isinstance(prev_opt_patch, dict):
-        p = prev_opt_patch.get("patch") or {}
-        if isinstance(p, dict) and p.get("type") == "unified_diff":
-            diff_text = p.get("content", "") or ""
-            if prev_cad_script_text is not None and diff_text.strip():
-                ok, msg, patched = _apply_unified_diff(prev_cad_script_text, diff_text)
-                if ok:
-                    code = patched
-                    code = _normalize_cadquery_export(code)
-                    ensure_dir(paths["artifacts"] / "render")
-                    write_text(cad_script_path, code)
-                    applied_by_diff = True
+    prompt = {
+        "run_id": run_id,
+        "attempt": attempt,
+        "plan_json": plan,
+        "allowed_ops": allowed_ops_list,
+        "instructions": (
+            "Output STRICT JSON only for ir.json.\n"
+            "ir.json must be executable by the deterministic executor.\n"
+            "Each operation MUST have fields: {id, op, args}.\n"
+            "Use args.out_id to name intermediate results.\n"
+            "\n"
+            "Reference rules:\n"
+            "- union/cut/intersect MUST use args.a_id and args.b_id (existing work ids).\n"
+            "- extrude MUST use args.sketch_id (existing sketch id).\n"
+            "- cut_extrude MUST use args.base_id and args.sketch_id.\n"
+            "\n"
+            "Hard rule: operations[*].op MUST be one of allowed_ops. Do NOT invent op names.\n"
+        ),
+    }
 
-    if not applied_by_diff:
-        prompt = {
-            "run_id": run_id,
-            "attempt": attempt,
-            "plan_json": plan,
-            "previous_opt_patch": prev_opt_patch,
-            "instructions": (
-                "Generate a single, complete CadQuery 2.x Python script that defines a Workplane variable named `result`. "
-                "The script will be executed with CWD = artifacts folder. DO NOT use any directory prefix when exporting. "
-                "If previous_opt_patch exists, apply it. "
-                "If previous_opt_patch.patch.type is 'unified_diff', you MUST implement exactly those changes."
-            ),
-        }
+    resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
+    ir = _extract_first_json(resp if isinstance(resp, str) else resp.get("content", ""))
 
-        resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
-        text = resp if isinstance(resp, str) else resp.get("content", "")
+    ir["run_id"] = run_id
+    ir["attempt"] = attempt
+    ir = sanitize_ir(ir)
 
-        code = text
-        m = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.S)
-        if m:
-            code = m.group(1).strip()
+    ops = ir.get("operations", []) or []
+    for i, op in enumerate(ops, start=1):
+        if not op.get("id"):
+            op["id"] = f"OP{i:02d}"
+    ir["operations"] = ops
 
-        code = _normalize_cadquery_export(code)
-
-        ensure_dir(paths["artifacts"] / "render")
-        write_text(cad_script_path, code)
+    write_json(ir_path, ir)
 
     write_json(event_path, build_event(
         run_id, "2", "Agent2_CADWriter", "success",
         inputs={"plan_json": str(plan_path), "attempt": attempt},
-        outputs={"cad_script": str(cad_script_path)},
-        message="cad_script.py created",
+        outputs={"ir_json": str(ir_path)},
+        message="ir.json created",
     ))
-    return cad_script_path
+    return ir_path
 
 
-def agent3_executor(run_id: str, paths: Dict[str, Path], cad_script_path: Path, agent, attempt: int) -> Path:
+def agent3_executor(run_id: str, paths: Dict[str, Path], ir_path: Path, agent, attempt: int) -> Path:
     manifest_path = paths["artifacts"] / "output_manifest.json"
     exec_log_path = paths["artifacts"] / "exec.log.txt"
     event_path = paths["events"] / "event3.json"
 
     write_json(event_path, build_event(
         run_id, "3", "Agent3_Executor", "start",
-        inputs={"cad_script": str(cad_script_path), "attempt": attempt},
+        inputs={"ir_json": str(ir_path), "attempt": attempt},
         outputs={"output_manifest": str(manifest_path), "exec_log": str(exec_log_path), "event": str(event_path)},
     ))
 
-    rc, out = _safe_run([sys.executable, str(Path(cad_script_path).resolve())], cwd=Path(cad_script_path).parent, timeout=180)
-    write_text(exec_log_path, out)
-
     render_dir = ensure_dir(paths["artifacts"] / "render")
 
-    step_files = [str(p) for p in paths["artifacts"].glob("*.step")] + [str(p) for p in paths["artifacts"].glob("*.stp")]
-    stl_files = [str(p) for p in paths["artifacts"].glob("*.stl")]
+    ir = read_json(ir_path)
+    ir = sanitize_ir(ir)
 
-    # ---- render views if STL exists (even if rc != 0, as long as STL is present) ----
+    warnings: List[str] = []
+    ops = ir.get("operations", []) or []
+    for i, op in enumerate(ops, start=1):
+        if not op.get("id"):
+            op["id"] = f"OP{i:02d}"
+            warnings.append(f"WARNING: operation at index {i} missing id -> filled as {op['id']}")
+    ir["operations"] = ops
+
+    exec_result, work_registry = execute_ir(ir)
+
+    log_lines: List[str] = []
+    log_lines.append(f"IR execution ok: {exec_result.ok}")
+    log_lines.append(f"Message: {exec_result.message}")
+    if warnings:
+        log_lines.append("---- warnings ----")
+        log_lines.extend(warnings)
+    log_lines.append(f"Final work_id: {exec_result.work_id}")
+    log_lines.append("---- op_trace ----")
+    for t in exec_result.op_trace:
+        log_lines.append(json.dumps(t, ensure_ascii=False))
+    if exec_result.exception:
+        log_lines.append("---- exception ----")
+        log_lines.append(exec_result.exception)
+    write_text(exec_log_path, "\n".join(log_lines))
+
+    step_files: List[str] = []
+    stl_files: List[str] = []
+    imgs: List[str] = []
+    geometry_metrics: Dict[str, Any] = {}
+    error_msg = ""
+
+    if exec_result.ok and exec_result.work_id and exec_result.work_id in work_registry:
+        try:
+            from cadquery import exporters  # type: ignore
+            final_obj = work_registry[exec_result.work_id]
+            exporters.export(final_obj, str(paths["artifacts"] / "model.step"))
+            exporters.export(final_obj, str(paths["artifacts"] / "model.stl"))
+            step_files = [str(p) for p in paths["artifacts"].glob("*.step")] + [str(p) for p in paths["artifacts"].glob("*.stp")]
+            stl_files = [str(p) for p in paths["artifacts"].glob("*.stl")]
+        except Exception as e:
+            error_msg = f"Export failed: {e}"
+    else:
+        if not exec_result.ok:
+            error_msg = exec_result.message
+        else:
+            error_msg = "Execution ok but no final work_id produced."
+
     render_msg = ""
     if stl_files:
-        ok, msg = _render_stl_to_png_multi6(Path(stl_files[0]), render_dir)
-        render_msg = msg if ok else f"render_failed: {msg}"
+        ok_r, msg_r = _render_stl_to_png_multi6(Path(stl_files[0]), render_dir)
+        render_msg = msg_r if ok_r else f"render_failed: {msg_r}"
+        imgs = list_rendered_images(render_dir)
+        try:
+            geometry_metrics = _compute_geometry_metrics_from_stl(Path(stl_files[0]))
+        except Exception as e:
+            geometry_metrics = {"error": f"metrics_failed: {e}"}
 
-    imgs = list_rendered_images(render_dir)
-
-    # ---- NEW: geometry metrics (non-image feedback for Agent5) ----
-    geometry_metrics: Dict[str, Any] = {}
-    try:
-        if stl_files:
-            stl_path = Path(stl_files[0])
-            tris = _parse_stl_triangles(stl_path)
-            if tris:
-                xs = [p[0] for tri in tris for p in tri]
-                ys = [p[1] for tri in tris for p in tri]
-                zs = [p[2] for tri in tris for p in tri]
-                geometry_metrics = {
-                    "stl_triangle_count": len(tris),
-                    "bbox": {
-                        "x_min": min(xs), "x_max": max(xs),
-                        "y_min": min(ys), "y_max": max(ys),
-                        "z_min": min(zs), "z_max": max(zs),
-                        "dx": max(xs) - min(xs),
-                        "dy": max(ys) - min(ys),
-                        "dz": max(zs) - min(zs),
-                    },
-                }
-    except Exception as e:
-        geometry_metrics = {"error": f"metrics_failed: {e}"}
-
-    # original success condition
     has_outputs = bool(step_files or stl_files)
-    status = "success" if (rc == 0 and has_outputs) else "fail"
-    error_msg = ""
-    if rc != 0:
-        error_msg = f"Execution failed, return code {rc}"
-    elif not has_outputs:
-        error_msg = "Execution returned 0 but produced no STEP/STL outputs."
+    status = "success" if (exec_result.ok and has_outputs and imgs) else "fail"
 
-    # if execution "success" but no render images, fail (4A requires PNGs)
-    if status == "success" and not imgs:
-        status = "fail"
-        error_msg = "Execution ok but produced no render images (PNG required for 4A). " + (render_msg or "")
+    if status == "fail" and not error_msg:
+        if not exec_result.ok:
+            error_msg = exec_result.message
+        elif not has_outputs:
+            error_msg = "Execution produced no STEP/STL outputs."
+        elif not imgs:
+            error_msg = "Execution produced geometry but no render images (PNG required for 4A). " + (render_msg or "")
 
     manifest = {
         "run_id": run_id,
         "attempt": attempt,
         "status": status,
-        "cad_script": str(cad_script_path),
+        "ir_json": str(ir_path),
         "step_files": step_files,
         "stl_files": stl_files,
         "render_images": imgs,
         "geometry_metrics": geometry_metrics,
+        "executor_debug": {
+            "ok": exec_result.ok,
+            "message": exec_result.message,
+            "work_id": exec_result.work_id,
+            "solid_count": exec_result.solid_count,
+            "op_trace": exec_result.op_trace,
+            "exception": exec_result.exception,
+        },
         "exec_log_path": str(exec_log_path),
         "artifacts_dir": str(paths["artifacts"]),
-        "return_code": rc,
         "error": error_msg,
     }
     write_json(manifest_path, manifest)
 
     write_json(event_path, build_event(
         run_id, "3", "Agent3_Executor", status,
-        inputs={"cad_script": str(cad_script_path), "attempt": attempt},
+        inputs={"ir_json": str(ir_path), "attempt": attempt},
         outputs={"output_manifest": str(manifest_path), "exec_log": str(exec_log_path)},
         message="execution finished",
         error=error_msg,
@@ -618,7 +598,6 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
     image_paths = manifest.get("render_images", []) or list_rendered_images(paths["artifacts"] / "render")
     exec_log_tail = _read_text_tail(Path(manifest.get("exec_log_path", paths["artifacts"] / "exec.log.txt")))
 
-    # hard rule: no images => fail
     if not image_paths:
         report = {
             "status": "fail",
@@ -645,47 +624,35 @@ def agent4a_verifier(run_id: str, paths: Dict[str, Path], plan_path: Path, manif
         ))
         return verify_path
 
-    content_payload: List[Dict[str, Any]] = [{"type": "text", "text": json.dumps({
-        "run_id": run_id,
-        "attempt": attempt,
-        "plan_json": plan,
-        "output_manifest": manifest,
-        "exec_log_tail": exec_log_tail,
-        "instructions": (
-            "You MUST verify geometry STRICTLY based on the provided render images AND the plan.\n"
-            "HARD RULES:\n"
-            "A) If ANY required feature is missing => status MUST be 'fail'.\n"
-            "B) If you cannot CONFIRM a required feature from the images => status MUST be 'fail'.\n"
-            "C) If there is any unrelated/extra floating geometry/part => status MUST be 'fail'.\n"
-            "\n"
-            "You must produce a field `feature_evidence_map` that maps each required feature to:\n"
-            "{confirmed: true|false, evidence_images: [filenames], note: string}\n"
-            "\n"
-            "Minimum required features for a mug-like object:\n"
-            "- cylindrical body\n"
-            "- hollow opening at top\n"
-            "- handle attached to body (NOT a separate floating piece)\n"
-            "- flat bottom\n"
-            "\n"
-            "PASS condition is very strict:\n"
-            "- issues must be empty AND\n"
-            "- every required feature must have confirmed=true AND evidence_images not empty.\n"
-            "\n"
-            "Return STRICT JSON only with schema:\n"
-            "{status: pass|fail, summary: string, issues: [], checks: [], feature_evidence_map: { ... }}\n"
-        )
-
-    }, ensure_ascii=False)}]
+    required_features = plan.get("required_features", [])
+    content_payload: List[Dict[str, Any]] = [{
+        "type": "text",
+        "text": json.dumps({
+            "run_id": run_id,
+            "attempt": attempt,
+            "plan_json": plan,
+            "required_features": required_features,
+            "output_manifest": manifest,
+            "exec_log_tail": exec_log_tail,
+            "instructions": (
+                "Verify geometry strictly based on render images AND plan.required_features.\n"
+                "HARD RULES:\n"
+                "A) Any must=true required feature missing => fail.\n"
+                "B) If you cannot confirm a must=true feature from images => fail.\n"
+                "C) Any unrelated extra geometry => fail.\n"
+                "\n"
+                "Output feature_evidence_map mapping feature.id -> {confirmed, evidence_images, note}.\n"
+                "Return STRICT JSON only.\n"
+            )
+        }, ensure_ascii=False)
+    }]
 
     for p in image_paths[:8]:
         try:
             img = Image.open(p)
             content_payload.append({"type": "image_url", "image_url": {"url": img}})
         except Exception as e:
-            content_payload.append({
-                "type": "text",
-                "text": f"[WARN] Failed to open image {p}: {e}"
-            })
+            content_payload.append({"type": "text", "text": f"[WARN] Failed to open image {p}: {e}"})
 
     resp = agent.generate_reply(messages=[{"role": "user", "content": content_payload}])
     text = resp if isinstance(resp, str) else resp.get("content", "")
@@ -717,7 +684,7 @@ def agent5_optimizer(
     run_id: str,
     paths: Dict[str, Path],
     plan_path: Path,
-    cad_script_path: Path,
+    ir_path: Path,
     manifest_path: Path,
     verify_path: Optional[Path],
     agent,
@@ -733,9 +700,9 @@ def agent5_optimizer(
     ))
 
     plan = read_json(plan_path)
+    ir = read_json(ir_path)
     manifest = read_json(manifest_path)
 
-    cad_script_text = Path(cad_script_path).read_text(encoding="utf-8", errors="ignore")
     exec_log_tail = _read_text_tail(Path(manifest.get("exec_log_path", paths["artifacts"] / "exec.log.txt")))
 
     verify = None
@@ -745,43 +712,48 @@ def agent5_optimizer(
         except Exception:
             verify = None
 
+    allowed_ops_list = [
+        "primitive_box","primitive_cylinder","primitive_sphere","primitive_torus",
+        "sketch_rect","sketch_circle","sketch_polygon",
+        "extrude","cut_extrude",
+        "translate","rotate",
+        "union","cut","intersect",
+        "hole","fillet","chamfer","shell"
+    ]
+
     prompt = {
         "run_id": run_id,
         "attempt": attempt,
         "plan_json": plan,
+        "ir_json": ir,
         "output_manifest": manifest,
         "exec_log_tail": exec_log_tail,
-        "cad_script": cad_script_text,
         "verify_report": verify,
+        "allowed_ops": allowed_ops_list,
         "instructions": (
             "Decide next_step for convergence.\n"
             "Allowed next_step only: '1' or '2'.\n"
-            "If execution failed => prefer need_fix_script next_step='2' unless plan wrong.\n"
-            "If verify failed => decide need_fix_script or need_replan.\n"
-            "Also use output_manifest.geometry_metrics (bbox/triangle_count) to diagnose scale/degenerate geometry and guide the patch.\n"
-            "IMPORTANT: patch MUST be a unified diff for the file cad_script.py (single file). "
-            "Set patch.type='unified_diff' and provide patch.content as a valid unified diff with @@ hunks.\n"
-            "Return STRICT JSON only."
+            "If verifier failed => prefer next_step='2' and patch ir.json to satisfy required_features.\n"
+            "If execution failed => prefer next_step='2' and patch the failing op (see executor_debug/op_trace).\n"
+            "\n"
+            "HARD RULE: You MUST NOT invent any operation names. "
+            "Any operation you add must be from allowed_ops.\n"
+            "\n"
+            "IMPORTANT: patch MUST be a unified diff for the file ir.json (single file).\n"
+            "Return STRICT JSON only.\n"
         ),
-        "output_schema": {
-            "status": "need_fix_script|need_replan",
-            "next_step": "1|2",
-            "suggestions": [],
-            "patch": {"type": "unified_diff", "content": "..."}
-        }
     }
 
     resp = agent.generate_reply(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}])
     patch = _extract_first_json(resp if isinstance(resp, str) else resp.get("content", ""))
 
-    patch.setdefault("status", "need_fix_script")
+    patch.setdefault("status", "need_fix_ir")
     patch.setdefault("next_step", "2")
     if str(patch.get("next_step")) not in ("1", "2"):
         patch["next_step"] = "2"
-    if patch.get("status") not in ("need_fix_script", "need_replan"):
-        patch["status"] = "need_fix_script"
+    if patch.get("status") not in ("need_fix_ir", "need_replan", "noop"):
+        patch["status"] = "need_fix_ir"
 
-    # ---- enforce unified_diff contract (non-breaking) ----
     if not isinstance(patch.get("patch"), dict):
         patch["patch"] = {"type": "unified_diff", "content": ""}
     else:
