@@ -3,7 +3,7 @@
 本仓库实现一个"主通路"多Agent CAD生成与验证流水线（MAAS）。  
 **人类用户只需输入 Anforderungsliste.yaml（需求文件）**，系统自动完成：规划 → IR编译 → 确定性执行建模 → 渲染证据 → MLLM评审 → 迭代优化 → 归档打包。
 
-> **核心设计理念**：采用 **路线B（IR/DSL + 确定性执行器）**，将LLM的"代码生成"职责转变为"结构描述"职责，显著提升复杂模型的稳定性与可调试性。
+> **核心设计理念**：采用 **路线（IR/DSL + 确定性执行器）**，将LLM的"代码生成"职责转变为"结构描述"职责，显著提升复杂模型的稳定性与可调试性。
 
 ---
 
@@ -124,6 +124,7 @@
     }
   ]
 }
+```
 
 ### 强制规则
 1. **操作顺序**: 先草图(`sketch_*`) → 再拉伸(`extrude`/`cut_extrude`)
@@ -156,12 +157,13 @@ source .venv/bin/activate
 
 # 安装依赖
 pip install -r requirements.txt
+```
 
 ### 2. 运行主通路
 ```bash
 # 基础运行
 python main.py --input test_1.yaml
-
+```
 # 完整参数示例
 python main.py \
   --input test_1.yaml \
