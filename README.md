@@ -145,6 +145,7 @@ workspace/runs/
 扩展建议: 在保持确定性的前提下，可逐步扩展revolve、sweep、loft等高级操作。
 
 ## 运行指南
+
 ### 1. 安装依赖
 # 创建虚拟环境
 python -m venv .venv
